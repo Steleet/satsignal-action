@@ -131,6 +131,7 @@ runs:
           -X POST "$BASE/api/v1/anchors" \
           -H "Authorization: Bearer $SATSIGNAL_API_KEY" \
           -H "Content-Type: application/json" \
+          -H "User-Agent: satsignal-action/v0" \
           --data-binary "$BODY")"
 
         # ---- handle errors -------------------------------------------
