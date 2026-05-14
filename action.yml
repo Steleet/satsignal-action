@@ -1,0 +1,190 @@
+name: 'Satsignal — Anchor a build artifact'
+description: 'Create a tamper-evident BSV anchor for a build artifact (eval report, release manifest, AI-generated code diff, etc.) and emit the receipt as step outputs.'
+author: 'Satsignal'
+
+branding:
+  icon: 'anchor'
+  color: 'blue'
+
+inputs:
+  path:
+    description: 'Path to the file to anchor, relative to the workspace.'
+    required: true
+  matter:
+    description: 'Matter slug in your Satsignal workspace. Receipts file under this matter.'
+    required: false
+    default: 'github-actions'
+  label:
+    description: 'Short label shown on the receipt (e.g. release tag, commit sha, eval-run id). Optional.'
+    required: false
+    default: ''
+  api-key:
+    description: 'Satsignal API key (Bearer). Wire this to a repository secret.'
+    required: true
+  api-base:
+    description: 'Satsignal API base URL. Defaults to the production customer host.'
+    required: false
+    default: 'https://app.satsignal.cloud'
+  force-new:
+    description: 'If "true", anchor even when the same sha was anchored in this matter before. Default "false" deduplicates and returns the prior receipt.'
+    required: false
+    default: 'false'
+  fail-on-error:
+    description: 'Fail the workflow step on API error. Default "true". Set "false" to record the error but continue.'
+    required: false
+    default: 'true'
+
+outputs:
+  bundle_id:
+    description: 'Bundle identifier (hex). Use with /bundle/<id>.mbnt to download the receipt.'
+    value: ${{ steps.anchor.outputs.bundle_id }}
+  txid:
+    description: 'On-chain BSV transaction id (hex). Verifiable on any block explorer.'
+    value: ${{ steps.anchor.outputs.txid }}
+  receipt_url:
+    description: 'URL to the receipt page on app.satsignal.cloud.'
+    value: ${{ steps.anchor.outputs.receipt_url }}
+  bundle_url:
+    description: 'URL to the .mbnt bundle download (Bearer-auth required).'
+    value: ${{ steps.anchor.outputs.bundle_url }}
+  sha256:
+    description: 'sha256 of the anchored file.'
+    value: ${{ steps.anchor.outputs.sha256 }}
+  duplicate:
+    description: '"true" if Satsignal returned a prior anchor for the same sha (no new broadcast). "false" for a fresh anchor.'
+    value: ${{ steps.anchor.outputs.duplicate }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Anchor artifact with Satsignal
+      id: anchor
+      shell: bash
+      # All user inputs flow through env vars, NOT `${{ }}` interpolated
+      # into the run script — `${{ inputs.label }}` directly in a bash
+      # heredoc is a command-injection sink (a label like `$(rm -rf /)`
+      # would execute). Env vars are exposed to bash as plain strings.
+      env:
+        SATSIGNAL_FILE: ${{ inputs.path }}
+        SATSIGNAL_MATTER: ${{ inputs.matter }}
+        SATSIGNAL_LABEL: ${{ inputs.label }}
+        SATSIGNAL_API_KEY: ${{ inputs.api-key }}
+        SATSIGNAL_API_BASE: ${{ inputs.api-base }}
+        SATSIGNAL_FORCE_NEW: ${{ inputs.force-new }}
+        SATSIGNAL_FAIL_ON_ERROR: ${{ inputs.fail-on-error }}
+      run: |
+        set -euo pipefail
+
+        # ---- input validation ----------------------------------------
+        if [[ -z "${SATSIGNAL_FILE:-}" ]]; then
+          echo "::error::input 'path' is required" >&2
+          exit 1
+        fi
+        if [[ -z "${SATSIGNAL_API_KEY:-}" ]]; then
+          echo "::error::input 'api-key' is required (wire it to a repository secret)" >&2
+          exit 1
+        fi
+        if [[ ! -f "$SATSIGNAL_FILE" ]]; then
+          echo "::error::file not found: $SATSIGNAL_FILE" >&2
+          exit 1
+        fi
+        # Trim trailing slash on the base URL — the action concatenates
+        # "$BASE/api/v1/anchors" below.
+        BASE="${SATSIGNAL_API_BASE%/}"
+
+        # ---- compute sha + size --------------------------------------
+        SHA="$(sha256sum "$SATSIGNAL_FILE" | awk '{print $1}')"
+        SIZE="$(wc -c <"$SATSIGNAL_FILE" | tr -d ' ')"
+        BASENAME="$(basename "$SATSIGNAL_FILE")"
+
+        echo "::group::Computed digest"
+        echo "  file:      $SATSIGNAL_FILE"
+        echo "  basename:  $BASENAME"
+        echo "  size:      $SIZE bytes"
+        echo "  sha256:    $SHA"
+        echo "::endgroup::"
+
+        # ---- build JSON body via jq (safe vs raw string concat) ------
+        FORCE_NEW_BOOL=false
+        if [[ "${SATSIGNAL_FORCE_NEW:-false}" == "true" ]]; then
+          FORCE_NEW_BOOL=true
+        fi
+
+        BODY="$(jq -nc \
+          --arg matter "${SATSIGNAL_MATTER:-github-actions}" \
+          --arg sha "$SHA" \
+          --argjson size "$SIZE" \
+          --arg label "${SATSIGNAL_LABEL:-}" \
+          --arg filename "$BASENAME" \
+          --argjson force_new "$FORCE_NEW_BOOL" \
+          '{
+            matter_slug: $matter,
+            sha256_hex: $sha,
+            file_size: $size,
+            filename: $filename,
+            force_new: $force_new,
+          } + (if $label == "" then {} else {label: $label} end)')"
+
+        # ---- POST /api/v1/anchors ------------------------------------
+        TMP_RESP="$(mktemp)"
+        HTTP_CODE="$(curl -sS -o "$TMP_RESP" -w '%{http_code}' \
+          -X POST "$BASE/api/v1/anchors" \
+          -H "Authorization: Bearer $SATSIGNAL_API_KEY" \
+          -H "Content-Type: application/json" \
+          --data-binary "$BODY")"
+
+        # ---- handle errors -------------------------------------------
+        if [[ "$HTTP_CODE" != "200" ]]; then
+          ERR_CODE="$(jq -r '.error.code // .error // "unknown"' <"$TMP_RESP" 2>/dev/null || echo "unparsable")"
+          ERR_MSG="$(jq -r '.error.message // .error // .' <"$TMP_RESP" 2>/dev/null || cat "$TMP_RESP")"
+          echo "::error::satsignal API $HTTP_CODE $ERR_CODE: $ERR_MSG" >&2
+          rm -f "$TMP_RESP"
+          if [[ "${SATSIGNAL_FAIL_ON_ERROR:-true}" == "true" ]]; then
+            exit 1
+          else
+            echo "fail-on-error=false; continuing despite error." >&2
+            exit 0
+          fi
+        fi
+
+        # ---- parse + emit step outputs -------------------------------
+        BUNDLE_ID="$(jq -r '.bundle_id // ""' <"$TMP_RESP")"
+        TXID="$(jq -r '.txid // ""' <"$TMP_RESP")"
+        RECEIPT_URL="$(jq -r '.receipt_url // ""' <"$TMP_RESP")"
+        BUNDLE_URL="$(jq -r '.bundle_url // ""' <"$TMP_RESP")"
+        DUPLICATE="$(jq -r '.duplicate // false' <"$TMP_RESP")"
+        rm -f "$TMP_RESP"
+
+        {
+          echo "bundle_id=$BUNDLE_ID"
+          echo "txid=$TXID"
+          echo "receipt_url=$RECEIPT_URL"
+          echo "bundle_url=$BUNDLE_URL"
+          echo "sha256=$SHA"
+          echo "duplicate=$DUPLICATE"
+        } >>"$GITHUB_OUTPUT"
+
+        echo "::group::Receipt"
+        echo "  bundle_id:    $BUNDLE_ID"
+        echo "  txid:         $TXID"
+        echo "  receipt_url:  $RECEIPT_URL"
+        echo "  duplicate:    $DUPLICATE"
+        echo "::endgroup::"
+
+        # GitHub Step Summary — Markdown block visible on the run page.
+        {
+          echo "### Satsignal anchor"
+          if [[ "$DUPLICATE" == "true" ]]; then
+            echo "_Duplicate detected. Returned the prior anchor for this sha — no new broadcast._"
+          fi
+          echo
+          echo "| field | value |"
+          echo "| --- | --- |"
+          echo "| file | \`$BASENAME\` |"
+          echo "| sha256 | \`$SHA\` |"
+          echo "| txid | \`$TXID\` |"
+          echo "| bundle_id | \`$BUNDLE_ID\` |"
+          if [[ -n "$RECEIPT_URL" ]]; then
+            echo "| receipt | [$RECEIPT_URL]($RECEIPT_URL) |"
+          fi
+        } >>"$GITHUB_STEP_SUMMARY"

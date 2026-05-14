@@ -1,0 +1,66 @@
+name: smoke
+
+# Self-test: run the action against a tiny file and confirm it returns
+# a chain-confirmed receipt. Requires repository secret SATSIGNAL_API_KEY
+# (anchors:create scope). The dedup gate means re-runs return the prior
+# receipt without burning new quota — this can run on every push.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    # Weekly canary — flags if the action breaks against the prod API
+    # without anyone landing a change.
+    - cron: '0 12 * * 1'
+
+jobs:
+  anchor-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create test artifact
+        # Deterministic content → same sha across runs → dedup hits the
+        # second time onward, no new on-chain broadcast / quota burn.
+        run: |
+          mkdir -p _smoke
+          printf 'satsignal-action smoke test\n' > _smoke/artifact.txt
+          echo "Expected sha256:"
+          sha256sum _smoke/artifact.txt
+
+      - name: Anchor the test artifact
+        id: anchor
+        uses: ./
+        with:
+          path: _smoke/artifact.txt
+          # `inbox` is auto-provisioned in every Satsignal workspace,
+          # so the smoke needs no preflight matter-create step. For
+          # production workflows pick a dedicated matter.
+          matter: inbox
+          label: ${{ github.workflow }}-${{ github.run_id }}
+          api-key: ${{ secrets.SATSIGNAL_API_KEY }}
+
+      - name: Assert receipt outputs are populated
+        run: |
+          set -euo pipefail
+          test -n "${{ steps.anchor.outputs.bundle_id }}" || (echo "::error::bundle_id empty"; exit 1)
+          test -n "${{ steps.anchor.outputs.txid }}"      || (echo "::error::txid empty"; exit 1)
+          test -n "${{ steps.anchor.outputs.sha256 }}"    || (echo "::error::sha256 empty"; exit 1)
+          test "${{ steps.anchor.outputs.sha256 }}" = "$(sha256sum _smoke/artifact.txt | awk '{print $1}')" \
+            || (echo "::error::sha256 output does not match local digest"; exit 1)
+          echo "All assertions passed."
+
+      - name: Verify the anchor is publicly indexed
+        # Round-trip the sha through /lookup_hash and confirm the txid
+        # we got back matches what the public resolver reports.
+        run: |
+          set -euo pipefail
+          SHA="${{ steps.anchor.outputs.sha256 }}"
+          TXID="${{ steps.anchor.outputs.txid }}"
+          INDEXED_TXID=$(curl -fsS "https://app.satsignal.cloud/lookup_hash?sha=$SHA" | jq -r '.txid // ""')
+          if [[ "$INDEXED_TXID" != "$TXID" ]]; then
+            echo "::error::lookup_hash returned txid=$INDEXED_TXID; action returned $TXID"
+            exit 1
+          fi
+          echo "Indexed txid matches: $INDEXED_TXID"
