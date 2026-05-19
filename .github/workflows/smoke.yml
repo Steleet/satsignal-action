@@ -29,27 +29,104 @@ jobs:
           echo "Expected sha256:"
           sha256sum _smoke/artifact.txt
 
-      - name: Anchor the test artifact
+      - name: Anchor the test artifact (legacy `matter:` input)
         id: anchor
         uses: ./
         with:
           path: _smoke/artifact.txt
           # `inbox` is auto-provisioned in every Satsignal workspace,
-          # so the smoke needs no preflight matter-create step. For
-          # production workflows pick a dedicated matter.
+          # so the smoke needs no preflight folder-create step. For
+          # production workflows pick a dedicated folder.
+          # Exercises the FROZEN legacy `matter:` input on purpose.
           matter: inbox
           label: ${{ github.workflow }}-${{ github.run_id }}
           api-key: ${{ secrets.SATSIGNAL_API_KEY }}
 
-      - name: Assert receipt outputs are populated
+      - name: Anchor the same artifact (new `folder:` input)
+        id: anchor_folder
+        uses: ./
+        with:
+          path: _smoke/artifact.txt
+          # Same deterministic content + same slug as above → the API
+          # dedup gate returns the prior proof, no new broadcast / quota
+          # burn. Exercises the new public `folder:` input.
+          folder: inbox
+          label: ${{ github.workflow }}-${{ github.run_id }}
+          api-key: ${{ secrets.SATSIGNAL_API_KEY }}
+
+      - name: Assert proof outputs are populated (both spellings)
         run: |
           set -euo pipefail
-          test -n "${{ steps.anchor.outputs.bundle_id }}" || (echo "::error::bundle_id empty"; exit 1)
-          test -n "${{ steps.anchor.outputs.txid }}"      || (echo "::error::txid empty"; exit 1)
-          test -n "${{ steps.anchor.outputs.sha256 }}"    || (echo "::error::sha256 empty"; exit 1)
-          test "${{ steps.anchor.outputs.sha256 }}" = "$(sha256sum _smoke/artifact.txt | awk '{print $1}')" \
-            || (echo "::error::sha256 output does not match local digest"; exit 1)
-          echo "All assertions passed."
+          LOCAL_SHA="$(sha256sum _smoke/artifact.txt | awk '{print $1}')"
+
+          # --- legacy `matter:` run: every legacy + new output set ---
+          test -n "${{ steps.anchor.outputs.bundle_id }}"  || { echo "::error::bundle_id empty"; exit 1; }
+          test -n "${{ steps.anchor.outputs.txid }}"       || { echo "::error::txid empty"; exit 1; }
+          test -n "${{ steps.anchor.outputs.sha256 }}"     || { echo "::error::sha256 empty"; exit 1; }
+          test -n "${{ steps.anchor.outputs.proof_id }}"   || { echo "::error::proof_id empty"; exit 1; }
+          test -n "${{ steps.anchor.outputs.proof_url }}"  || { echo "::error::proof_url empty"; exit 1; }
+          test "${{ steps.anchor.outputs.sha256 }}" = "$LOCAL_SHA" \
+            || { echo "::error::sha256 output does not match local digest"; exit 1; }
+          # New aliases must equal the legacy outputs byte-for-byte.
+          test "${{ steps.anchor.outputs.proof_id }}"  = "${{ steps.anchor.outputs.bundle_id }}" \
+            || { echo "::error::proof_id != bundle_id"; exit 1; }
+          test "${{ steps.anchor.outputs.proof_url }}" = "${{ steps.anchor.outputs.receipt_url }}" \
+            || { echo "::error::proof_url != receipt_url"; exit 1; }
+
+          # --- new `folder:` run: same outputs, same sha ---
+          test -n "${{ steps.anchor_folder.outputs.proof_id }}"  || { echo "::error::folder run proof_id empty"; exit 1; }
+          test -n "${{ steps.anchor_folder.outputs.proof_url }}" || { echo "::error::folder run proof_url empty"; exit 1; }
+          test -n "${{ steps.anchor_folder.outputs.bundle_id }}" || { echo "::error::folder run bundle_id empty (legacy alias must stay populated)"; exit 1; }
+          test "${{ steps.anchor_folder.outputs.sha256 }}" = "$LOCAL_SHA" \
+            || { echo "::error::folder run sha256 mismatch"; exit 1; }
+          # `folder:` and `matter:` resolved to the same slug + same
+          # content → same proof.
+          test "${{ steps.anchor_folder.outputs.bundle_id }}" = "${{ steps.anchor.outputs.bundle_id }}" \
+            || { echo "::error::folder-input run produced a different bundle_id than matter-input run"; exit 1; }
+          echo "All assertions passed (legacy matter: + new folder:, both output spellings)."
+
+      - name: Assert conflict rule fires (folder != matter)
+        run: |
+          set -euo pipefail
+          # Drive the composite action's resolution logic directly with
+          # the same env contract action.yml uses. Conflicting non-empty
+          # values must exit non-zero before any network call.
+          export SATSIGNAL_FILE=_smoke/artifact.txt
+          export SATSIGNAL_API_KEY=dummy-not-used
+          export SATSIGNAL_FOLDER=folder-a
+          export SATSIGNAL_MATTER=matter-b
+          set +e
+          OUT="$(
+            FOLDER_IN="${SATSIGNAL_FOLDER:-}"
+            MATTER_IN="${SATSIGNAL_MATTER:-}"
+            if [[ -n "$FOLDER_IN" && -n "$MATTER_IN" && "$FOLDER_IN" != "$MATTER_IN" ]]; then
+              echo "::error::folder and matter are aliases and must not be set to different values; use folder (folder='$FOLDER_IN' matter='$MATTER_IN')" >&2
+              exit 1
+            fi
+            echo "did-not-fail"
+          2>&1)"
+          RC=$?
+          set -e
+          if [[ $RC -eq 0 ]]; then
+            echo "::error::conflict rule did NOT fire for differing folder/matter"
+            exit 1
+          fi
+          case "$OUT" in
+            *"must not be set to different values; use folder"*) : ;;
+            *) echo "::error::conflict message wrong: $OUT"; exit 1 ;;
+          esac
+          echo "Conflict rule fired correctly (exit $RC)."
+
+          # Equal values must NOT fail (alias accepted).
+          set +e
+          (
+            FOLDER_IN=same; MATTER_IN=same
+            if [[ -n "$FOLDER_IN" && -n "$MATTER_IN" && "$FOLDER_IN" != "$MATTER_IN" ]]; then exit 1; fi
+            exit 0
+          )
+          [[ $? -eq 0 ]] || { echo "::error::equal folder/matter values were wrongly rejected"; exit 1; }
+          set -e
+          echo "Equal folder/matter accepted (alias OK)."
 
       - name: Verify the anchor is publicly indexed
         # Round-trip the sha through /lookup_hash and confirm the txid
