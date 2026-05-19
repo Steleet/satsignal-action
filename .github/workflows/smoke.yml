@@ -97,14 +97,16 @@ jobs:
           export SATSIGNAL_MATTER=matter-b
           set +e
           OUT="$(
-            FOLDER_IN="${SATSIGNAL_FOLDER:-}"
-            MATTER_IN="${SATSIGNAL_MATTER:-}"
-            if [[ -n "$FOLDER_IN" && -n "$MATTER_IN" && "$FOLDER_IN" != "$MATTER_IN" ]]; then
-              echo "::error::folder and matter are aliases and must not be set to different values; use folder (folder='$FOLDER_IN' matter='$MATTER_IN')" >&2
-              exit 1
-            fi
-            echo "did-not-fail"
-          2>&1)"
+            {
+              FOLDER_IN="${SATSIGNAL_FOLDER:-}"
+              MATTER_IN="${SATSIGNAL_MATTER:-}"
+              if [[ -n "$FOLDER_IN" && -n "$MATTER_IN" && "$FOLDER_IN" != "$MATTER_IN" ]]; then
+                echo "::error::folder and matter are aliases and must not be set to different values; use folder (folder='$FOLDER_IN' matter='$MATTER_IN')" >&2
+                exit 1
+              fi
+              echo "did-not-fail"
+            } 2>&1
+          )"
           RC=$?
           set -e
           if [[ $RC -eq 0 ]]; then
