@@ -10,10 +10,14 @@ inputs:
   path:
     description: 'Path to the file to anchor, relative to the workspace.'
     required: true
-  matter:
-    description: 'Matter slug in your Satsignal workspace. Receipts file under this matter.'
+  folder:
+    description: 'Folder slug in your Satsignal workspace. Proofs file under this folder. Preferred public name; alias of (and takes precedence over) the legacy `matter:` input. If both are set to different non-empty values the step fails.'
     required: false
-    default: 'github-actions'
+    default: ''
+  matter:
+    description: 'Legacy alias of `folder:` — kept working forever. Slug in your Satsignal workspace. New workflows should use `folder:`.'
+    required: false
+    default: ''
   label:
     description: 'Short label shown on the receipt (e.g. release tag, commit sha, eval-run id). Optional.'
     required: false
@@ -35,14 +39,20 @@ inputs:
     default: 'true'
 
 outputs:
+  proof_id:
+    description: 'Proof identifier (hex). Use with /bundle/<id>.mbnt to download the proof. Preferred public name; alias of `bundle_id`.'
+    value: ${{ steps.anchor.outputs.proof_id }}
   bundle_id:
-    description: 'Bundle identifier (hex). Use with /bundle/<id>.mbnt to download the receipt.'
+    description: 'Legacy alias of `proof_id` — kept working forever. Bundle identifier (hex).'
     value: ${{ steps.anchor.outputs.bundle_id }}
   txid:
     description: 'On-chain BSV transaction id (hex). Verifiable on any block explorer.'
     value: ${{ steps.anchor.outputs.txid }}
+  proof_url:
+    description: 'URL to the proof page on app.satsignal.cloud. Preferred public name; alias of `receipt_url`.'
+    value: ${{ steps.anchor.outputs.proof_url }}
   receipt_url:
-    description: 'URL to the receipt page on app.satsignal.cloud.'
+    description: 'Legacy alias of `proof_url` — kept working forever. URL to the proof page.'
     value: ${{ steps.anchor.outputs.receipt_url }}
   bundle_url:
     description: 'URL to the .mbnt bundle download (Bearer-auth required).'
@@ -66,6 +76,7 @@ runs:
       # would execute). Env vars are exposed to bash as plain strings.
       env:
         SATSIGNAL_FILE: ${{ inputs.path }}
+        SATSIGNAL_FOLDER: ${{ inputs.folder }}
         SATSIGNAL_MATTER: ${{ inputs.matter }}
         SATSIGNAL_LABEL: ${{ inputs.label }}
         SATSIGNAL_API_KEY: ${{ inputs.api-key }}
@@ -88,6 +99,36 @@ runs:
           echo "::error::file not found: $SATSIGNAL_FILE" >&2
           exit 1
         fi
+        # ---- resolve folder/matter alias (additive, compat-preserving)
+        # `folder:` is the preferred public input; `matter:` is the
+        # frozen legacy alias. Resolution rules (must mirror the
+        # Satsignal API's conflicting_alias behavior):
+        #   - both set & DIFFER (non-empty) -> fail loudly, non-zero
+        #   - both set & equal              -> accept
+        #   - only one set                  -> use it
+        #   - neither set                   -> legacy default below
+        # `folder` takes precedence over `matter` when equal/only-one.
+        # The resolved value is folded into the FROZEN wire key
+        # `matter_slug` in the JSON body — `folder_slug` is never sent
+        # on the wire (older / self-hosted servers only accept
+        # `matter_slug`; emitting `folder_slug` would break them).
+        FOLDER_IN="${SATSIGNAL_FOLDER:-}"
+        MATTER_IN="${SATSIGNAL_MATTER:-}"
+        if [[ -n "$FOLDER_IN" && -n "$MATTER_IN" && "$FOLDER_IN" != "$MATTER_IN" ]]; then
+          echo "::error::folder and matter are aliases and must not be set to different values; use folder (folder='$FOLDER_IN' matter='$MATTER_IN')" >&2
+          exit 1
+        fi
+        if [[ -n "$FOLDER_IN" ]]; then
+          RESOLVED_SLUG="$FOLDER_IN"
+        elif [[ -n "$MATTER_IN" ]]; then
+          RESOLVED_SLUG="$MATTER_IN"
+        else
+          # Frozen legacy default: an unchanged caller that sets
+          # neither input still files under `github-actions`, exactly
+          # as before this alias was added.
+          RESOLVED_SLUG="github-actions"
+        fi
+
         # Trim trailing slash on the base URL — the action concatenates
         # "$BASE/api/v1/anchors" below.
         BASE="${SATSIGNAL_API_BASE%/}"
@@ -110,8 +151,11 @@ runs:
           FORCE_NEW_BOOL=true
         fi
 
+        # Wire key stays `matter_slug` FOREVER (every Satsignal server,
+        # incl. older/self-hosted, accepts it). The resolved value may
+        # have come from the new `folder:` input.
         BODY="$(jq -nc \
-          --arg matter "${SATSIGNAL_MATTER:-github-actions}" \
+          --arg matter "$RESOLVED_SLUG" \
           --arg sha "$SHA" \
           --argjson size "$SIZE" \
           --arg label "${SATSIGNAL_LABEL:-}" \
@@ -149,20 +193,28 @@ runs:
         fi
 
         # ---- parse + emit step outputs -------------------------------
-        BUNDLE_ID="$(jq -r '.bundle_id // ""' <"$TMP_RESP")"
+        # Read the new `proof_*` response keys if the server emits them
+        # (current API), else fall back to the frozen legacy keys
+        # (older / self-hosted servers). Both legacy AND new step
+        # outputs are then set so consumers on either spelling work.
+        BUNDLE_ID="$(jq -r '.proof_id // .bundle_id // ""' <"$TMP_RESP")"
         TXID="$(jq -r '.txid // ""' <"$TMP_RESP")"
-        RECEIPT_URL="$(jq -r '.receipt_url // ""' <"$TMP_RESP")"
+        RECEIPT_URL="$(jq -r '.proof_url // .receipt_url // ""' <"$TMP_RESP")"
         BUNDLE_URL="$(jq -r '.bundle_url // ""' <"$TMP_RESP")"
         DUPLICATE="$(jq -r '.duplicate // false' <"$TMP_RESP")"
         rm -f "$TMP_RESP"
 
         {
+          # legacy outputs — byte-identical names, kept forever
           echo "bundle_id=$BUNDLE_ID"
           echo "txid=$TXID"
           echo "receipt_url=$RECEIPT_URL"
           echo "bundle_url=$BUNDLE_URL"
           echo "sha256=$SHA"
           echo "duplicate=$DUPLICATE"
+          # new public aliases — same values
+          echo "proof_id=$BUNDLE_ID"
+          echo "proof_url=$RECEIPT_URL"
         } >>"$GITHUB_OUTPUT"
 
         echo "::group::Receipt"
