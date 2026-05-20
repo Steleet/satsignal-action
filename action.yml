@@ -37,6 +37,10 @@ inputs:
     description: 'Fail the workflow step on API error. Default "true". Set "false" to record the error but continue.'
     required: false
     default: 'true'
+  provenance:
+    description: 'If "true", wrap the file digest in a satsignal.provenance.v1 manifest with typed-authority metadata (authority, principal, organization, agent, run_scope) populated from the GitHub Actions environment, and anchor that manifest via POST /api/v1/provenance/anchor. The file digest still rides as `subject.digest` inside the manifest — bytes never leave the runner. Off by default; existing workflows keep emitting raw file-digest anchors unchanged. Requires Phase-4 (2026-05-20) Satsignal notary or later for the typed-authority fields to be honored; older servers will reject with `unknown_field`.'
+    required: false
+    default: 'false'
 
 outputs:
   proof_id:
@@ -83,6 +87,7 @@ runs:
         SATSIGNAL_API_BASE: ${{ inputs.api-base }}
         SATSIGNAL_FORCE_NEW: ${{ inputs.force-new }}
         SATSIGNAL_FAIL_ON_ERROR: ${{ inputs.fail-on-error }}
+        SATSIGNAL_PROVENANCE: ${{ inputs.provenance }}
       run: |
         set -euo pipefail
 
@@ -151,28 +156,122 @@ runs:
           FORCE_NEW_BOOL=true
         fi
 
-        # Wire key stays `matter_slug` FOREVER (every Satsignal server,
-        # incl. older/self-hosted, accepts it). The resolved value may
-        # have come from the new `folder:` input.
-        BODY="$(jq -nc \
-          --arg matter "$RESOLVED_SLUG" \
-          --arg sha "$SHA" \
-          --argjson size "$SIZE" \
-          --arg label "${SATSIGNAL_LABEL:-}" \
-          --arg filename "$BASENAME" \
-          --argjson force_new "$FORCE_NEW_BOOL" \
-          '{
-            matter_slug: $matter,
-            sha256_hex: $sha,
-            file_size: $size,
-            filename: $filename,
-            force_new: $force_new,
-          } + (if $label == "" then {} else {label: $label} end)')"
+        PROVENANCE_BOOL=false
+        if [[ "${SATSIGNAL_PROVENANCE:-false}" == "true" ]]; then
+          PROVENANCE_BOOL=true
+        fi
 
-        # ---- POST /api/v1/anchors ------------------------------------
+        if [[ "$PROVENANCE_BOOL" == "true" ]]; then
+          # ---- typed-authority provenance.v1 manifest ----------------
+          # Build the satsignal.provenance.v1 envelope with the
+          # typed-authority block (Phase-4 / 2026-05-20) populated from
+          # the GitHub Actions environment. Empty env vars are omitted
+          # rather than emitted as empty strings — the notary's strict
+          # validator rejects empty ids and unknown shapes.
+          #
+          # subject.digest carries the FILE sha (the bytes never leave
+          # the runner); the on-chain commitment is over the JCS-
+          # canonical sha256 of this whole manifest.
+          GH_OWNER="${GITHUB_REPOSITORY_OWNER:-}"
+          GH_REPO="${GITHUB_REPOSITORY:-}"
+          GH_ACTOR="${GITHUB_ACTOR:-}"
+          GH_WORKFLOW_REF="${GITHUB_WORKFLOW_REF:-}"
+          GH_WORKFLOW="${GITHUB_WORKFLOW:-}"
+          GH_WORKFLOW_SHA="${GITHUB_WORKFLOW_SHA:-${GITHUB_SHA:-}}"
+          GH_REF_NAME="${GITHUB_REF_NAME:-}"
+          GH_RUNNER_NAME="${GITHUB_RUNNER_NAME:-}"
+
+          # run_scope.id: GITHUB_WORKFLOW_REF is GitHub's canonical form,
+          # already `<owner>/<repo>/.github/workflows/<file>@<ref>`.
+          # Use it verbatim when available. Fall back to <name>@<sha>
+          # when only the legacy GITHUB_WORKFLOW name is set. Empty is
+          # invalid per the validator; we drop run_scope entirely if
+          # we can't form a stable id.
+          if [[ -n "$GH_WORKFLOW_REF" ]]; then
+            RUN_SCOPE_ID="$GH_WORKFLOW_REF"
+          elif [[ -n "$GH_WORKFLOW" && -n "$GH_WORKFLOW_SHA" ]]; then
+            RUN_SCOPE_ID="${GH_WORKFLOW}@${GH_WORKFLOW_SHA}"
+          elif [[ -n "$GH_WORKFLOW" ]]; then
+            RUN_SCOPE_ID="$GH_WORKFLOW"
+          else
+            RUN_SCOPE_ID=""
+          fi
+
+          # agent.id: distinguish runners when available, so audit packets
+          # can tell self-hosted-A from self-hosted-B traffic.
+          if [[ -n "$GH_RUNNER_NAME" ]]; then
+            AGENT_ID="github-actions/${GH_RUNNER_NAME}"
+          else
+            AGENT_ID="github-actions"
+          fi
+
+          MANIFEST="$(jq -nc \
+            --arg sha "$SHA" \
+            --arg owner "$GH_OWNER" \
+            --arg repo "$GH_REPO" \
+            --arg actor "$GH_ACTOR" \
+            --arg agent_id "$AGENT_ID" \
+            --arg run_scope_id "$RUN_SCOPE_ID" \
+            --arg ref_name "$GH_REF_NAME" \
+            '{
+              schema: "satsignal.provenance.v1",
+              source: ({type: "github"}
+                       + (if $repo  != "" then {id: $repo}  else {} end)),
+              subject: {type: "artifact", digest: ("sha256:" + $sha)},
+              privacy: {onchain_mode: "hash_only"}
+            }
+            + (if $owner != "" then {
+                authority:    {type: "organization", id: ("github:" + $owner), name: $owner},
+                organization: {type: "company",      id: ("github:" + $owner)}
+              } else {} end)
+            + (if $actor != "" then {
+                principal: {type: "service-account", id: ("github:" + $actor), name: $actor}
+              } else {} end)
+            + {agent: {type: "ci-runner", id: $agent_id}}
+            + (if $run_scope_id != "" then {
+                run_scope: ({type: "workflow", id: $run_scope_id}
+                            + (if $ref_name != "" then {environment: $ref_name} else {} end))
+              } else {} end)')"
+
+          BODY="$(jq -nc \
+            --arg matter "$RESOLVED_SLUG" \
+            --arg label "${SATSIGNAL_LABEL:-}" \
+            --argjson manifest "$MANIFEST" \
+            --argjson force_new "$FORCE_NEW_BOOL" \
+            '{matter_slug: $matter, manifest: $manifest, force_new: $force_new}
+             + (if $label == "" then {} else {label: $label} end)')"
+
+          ENDPOINT="$BASE/api/v1/provenance/anchor"
+          echo "::group::Provenance manifest"
+          echo "$MANIFEST" | jq .
+          echo "::endgroup::"
+        else
+          # ---- standard digest-only anchor body (unchanged) ----------
+          # Wire key stays `matter_slug` FOREVER (every Satsignal server,
+          # incl. older/self-hosted, accepts it). The resolved value may
+          # have come from the new `folder:` input.
+          BODY="$(jq -nc \
+            --arg matter "$RESOLVED_SLUG" \
+            --arg sha "$SHA" \
+            --argjson size "$SIZE" \
+            --arg label "${SATSIGNAL_LABEL:-}" \
+            --arg filename "$BASENAME" \
+            --argjson force_new "$FORCE_NEW_BOOL" \
+            '{
+              matter_slug: $matter,
+              sha256_hex: $sha,
+              file_size: $size,
+              filename: $filename,
+              force_new: $force_new,
+            } + (if $label == "" then {} else {label: $label} end)')"
+
+          ENDPOINT="$BASE/api/v1/anchors"
+        fi
+
+        # ---- POST $ENDPOINT ------------------------------------------
         TMP_RESP="$(mktemp)"
         HTTP_CODE="$(curl -sS -o "$TMP_RESP" -w '%{http_code}' \
-          -X POST "$BASE/api/v1/anchors" \
+          -X POST "$ENDPOINT" \
           -H "Authorization: Bearer $SATSIGNAL_API_KEY" \
           -H "Content-Type: application/json" \
           -H "User-Agent: satsignal-action/v0" \
