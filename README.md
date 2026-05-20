@@ -47,6 +47,7 @@ Satsignal. The file's bytes never leave the runner.
 | `force-new` | no | `false` | Re-anchor even if sha was seen before |
 | `api-base` | no | `https://app.satsignal.cloud` | Override only for self-hosted |
 | `fail-on-error` | no | `true` | Record + continue if `false` |
+| `provenance` | no | `false` | Wrap the digest in a `satsignal.provenance.v1` manifest with typed-authority metadata from the GitHub Actions env (see below). |
 
 ¹ When neither `folder` nor `matter` is set the slug defaults to
 `github-actions` (unchanged from before). `folder` takes precedence over
@@ -97,6 +98,63 @@ response keys when present and transparently falls back to the legacy
         body: `Release manifest anchored on BSV: [\`${{ steps.anchor.outputs.txid }}\`](${{ steps.anchor.outputs.proof_url }})`,
       })
 ```
+
+## Provenance mode (typed-authority)
+
+By default the action anchors a bare file digest. Set `provenance:
+'true'` to instead build a `satsignal.provenance.v1` manifest with a
+typed-authority block (Phase-4 / 2026-05-20) and anchor that
+manifest. The file digest still rides as `subject.digest` inside the
+manifest — bytes never leave the runner.
+
+```yaml
+- name: Anchor with provenance
+  uses: Steleet/satsignal-action@v0
+  with:
+    path: ./eval-results.json
+    folder: ai-evals
+    provenance: 'true'                          # opt in
+    api-key: ${{ secrets.SATSIGNAL_API_KEY }}
+```
+
+### What the manifest captures
+
+The action populates these fields from the GitHub Actions environment.
+Empty env vars are omitted; the notary's strict validator rejects empty
+ids.
+
+| Manifest field | Source | Example |
+|---|---|---|
+| `source` | `{type: "github", id: $GITHUB_REPOSITORY}` | `acme/widgets` |
+| `subject.digest` | `sha256(path)` | `sha256:fbe7…` |
+| `authority` | `{type: "organization", id: "github:$GITHUB_REPOSITORY_OWNER", name: …}` | `github:acme` |
+| `organization` | `{type: "company", id: "github:$GITHUB_REPOSITORY_OWNER"}` | `github:acme` |
+| `principal` | `{type: "service-account", id: "github:$GITHUB_ACTOR", name: …}` | `github:deploy-bot[bot]` |
+| `agent` | `{type: "ci-runner", id: "github-actions/$GITHUB_RUNNER_NAME"}` | `github-actions/Hosted-12` |
+| `run_scope` | `{type: "workflow", id: $GITHUB_WORKFLOW_REF, environment: $GITHUB_REF_NAME}` | `acme/widgets/.github/workflows/release.yml@refs/tags/v1.4.2` |
+| `privacy` | `{onchain_mode: "hash_only"}` | — |
+
+`run_scope.id` uses `$GITHUB_WORKFLOW_REF` (GitHub's canonical form
+that already pins both workflow path and ref), falling back to
+`$GITHUB_WORKFLOW@$GITHUB_WORKFLOW_SHA` when only the legacy env var is
+set.
+
+### Verifying a typed-authority anchor
+
+The output set is identical to standard mode (`proof_id`, `txid`,
+`proof_url`, etc.). The full canonical manifest ships inside the
+`.mbnt` bundle and is byte-exactly re-derivable offline — anyone with
+the bundle can JCS-canonicalize the manifest, sha256 it, and walk
+that hash to the on-chain transaction without calling any Satsignal
+API. See [provenance-v1.md](https://proof.satsignal.cloud/spec-provenance)
+§8 for the validator surface.
+
+### Server requirements
+
+Requires Phase-4 (2026-05-20) Satsignal notary or later. Older /
+self-hosted servers will reject the typed-authority fields as
+`unknown_field`. Keep `provenance: 'false'` (the default) for workflows
+that target older deployments.
 
 ## Dedup behavior
 
