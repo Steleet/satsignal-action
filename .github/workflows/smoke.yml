@@ -8,6 +8,10 @@ name: smoke
 on:
   push:
     branches: [main]
+  # PRs run only the static jq16-compat job below; the live anchor smoke
+  # (secret + prod API) stays push/dispatch/schedule-only.
+  pull_request:
+    branches: [main]
   workflow_dispatch:
   schedule:
     # Weekly canary — flags if the action breaks against the prod API
@@ -15,7 +19,33 @@ on:
     - cron: '0 12 * * 1'
 
 jobs:
+  jq16-compat:
+    # The default-path jq object literal once carried a trailing comma —
+    # accepted by jq 1.7 (ubuntu-24.04) but a SYNTAX ERROR on jq 1.6
+    # (ubuntu-22.04 runners and many self-hosted boxes), which killed the
+    # anchor step under `set -euo pipefail` (probe S2-F2, 2026-06-10).
+    # Guard the whole class statically: no line in action.yml may end
+    # with a comma when the next code line opens with `}` or `)`.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: No trailing commas before closing braces (jq 1.6 compat)
+        run: |
+          set -euo pipefail
+          BAD="$(awk 'prev ~ /,[[:space:]]*$/ && $0 ~ /^[[:space:]]*[})]/ \
+                        {print prevnr ": " prev} \
+                      {prev=$0; prevnr=NR}' action.yml)"
+          if [[ -n "$BAD" ]]; then
+            echo "::error::trailing comma before }/) in action.yml — jq 1.6 rejects this:"
+            echo "$BAD"
+            exit 1
+          fi
+          echo "OK: no trailing commas before closing braces."
+
   anchor-smoke:
+    # Needs SATSIGNAL_API_KEY and anchors against the live API — keep it
+    # off the PR path so the static guard alone gates merges.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

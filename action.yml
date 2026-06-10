@@ -264,7 +264,7 @@ runs:
               sha256_hex: $sha,
               file_size: $size,
               filename: $filename,
-              force_new: $force_new,
+              force_new: $force_new
             } + (if $label == "" then {} else {label: $label} end)')"
 
           ENDPOINT="$BASE/api/v1/anchors"
