@@ -8,6 +8,10 @@ name: smoke
 on:
   push:
     branches: [main]
+  # PRs run only the static jq16-compat job below; the live anchor smoke
+  # (secret + prod API) stays push/dispatch/schedule-only.
+  pull_request:
+    branches: [main]
   workflow_dispatch:
   schedule:
     # Weekly canary — flags if the action breaks against the prod API
@@ -39,6 +43,9 @@ jobs:
           echo "OK: no trailing commas before closing braces."
 
   anchor-smoke:
+    # Needs SATSIGNAL_API_KEY and anchors against the live API — keep it
+    # off the PR path so the static guard alone gates merges.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
