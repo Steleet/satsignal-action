@@ -11,7 +11,7 @@ inputs:
     description: 'Path to the file to anchor, relative to the workspace.'
     required: true
   folder:
-    description: 'Folder slug in your Satsignal workspace. Proofs file under this folder. Preferred public name; alias of (and takes precedence over) the legacy `matter:` input. If both are set to different non-empty values the step fails.'
+    description: 'Folder slug in your Satsignal workspace. Proofs file under this folder. Canonical name (sent on the wire as `folder_slug`); takes precedence over the legacy `matter:` alias. If both are set to different non-empty values the step fails.'
     required: false
     default: ''
   matter:
@@ -30,7 +30,7 @@ inputs:
     required: false
     default: 'https://app.satsignal.cloud'
   force-new:
-    description: 'If "true", anchor even when the same sha was anchored in this matter before. Default "false" deduplicates and returns the prior receipt.'
+    description: 'If "true", anchor even when the same sha was anchored in this folder before. Default "false" deduplicates and returns the prior proof.'
     required: false
     default: 'false'
   fail-on-error:
@@ -44,19 +44,19 @@ inputs:
 
 outputs:
   proof_id:
-    description: 'Proof identifier (hex). Use with /bundle/<id>.mbnt to download the proof. Preferred public name; alias of `bundle_id`.'
+    description: 'Proof identifier (hex). Use with /bundle/<id>.mbnt to download the proof. Canonical name (was `bundle_id`).'
     value: ${{ steps.anchor.outputs.proof_id }}
   bundle_id:
-    description: 'Legacy alias of `proof_id` — kept working forever. Bundle identifier (hex).'
+    description: 'Legacy alias of `proof_id` — kept working forever, same value.'
     value: ${{ steps.anchor.outputs.bundle_id }}
   txid:
     description: 'On-chain BSV transaction id (hex). Verifiable on any block explorer.'
     value: ${{ steps.anchor.outputs.txid }}
   proof_url:
-    description: 'URL to the proof page on app.satsignal.cloud. Preferred public name; alias of `receipt_url`.'
+    description: 'URL to the proof page on app.satsignal.cloud. Canonical name (was `receipt_url`).'
     value: ${{ steps.anchor.outputs.proof_url }}
   receipt_url:
-    description: 'Legacy alias of `proof_url` — kept working forever. URL to the proof page.'
+    description: 'Legacy alias of `proof_url` — kept working forever, same value.'
     value: ${{ steps.anchor.outputs.receipt_url }}
   bundle_url:
     description: 'URL to the .mbnt bundle download (Bearer-auth required).'
@@ -113,10 +113,12 @@ runs:
         #   - only one set                  -> use it
         #   - neither set                   -> legacy default below
         # `folder` takes precedence over `matter` when equal/only-one.
-        # The resolved value is folded into the FROZEN wire key
-        # `matter_slug` in the JSON body — `folder_slug` is never sent
-        # on the wire (older / self-hosted servers only accept
-        # `matter_slug`; emitting `folder_slug` would break them).
+        # The resolved value is sent as the CANONICAL wire key
+        # `folder_slug` (vocabulary sunset, 2026-06). Current Satsignal
+        # servers emit canonical-only responses and accept legacy
+        # request keys as silent aliases; tooling must send canonical.
+        # Self-hosted servers older than the sunset only accept
+        # `matter_slug` — pin satsignal-action@v0.3.0 against those.
         FOLDER_IN="${SATSIGNAL_FOLDER:-}"
         MATTER_IN="${SATSIGNAL_MATTER:-}"
         if [[ -n "$FOLDER_IN" && -n "$MATTER_IN" && "$FOLDER_IN" != "$MATTER_IN" ]]; then
@@ -234,11 +236,11 @@ runs:
               } else {} end)')"
 
           BODY="$(jq -nc \
-            --arg matter "$RESOLVED_SLUG" \
+            --arg folder "$RESOLVED_SLUG" \
             --arg label "${SATSIGNAL_LABEL:-}" \
             --argjson manifest "$MANIFEST" \
             --argjson force_new "$FORCE_NEW_BOOL" \
-            '{matter_slug: $matter, manifest: $manifest, force_new: $force_new}
+            '{folder_slug: $folder, manifest: $manifest, force_new: $force_new}
              + (if $label == "" then {} else {label: $label} end)')"
 
           ENDPOINT="$BASE/api/v1/provenance/anchor"
@@ -246,19 +248,19 @@ runs:
           echo "$MANIFEST" | jq .
           echo "::endgroup::"
         else
-          # ---- standard digest-only anchor body (unchanged) ----------
-          # Wire key stays `matter_slug` FOREVER (every Satsignal server,
-          # incl. older/self-hosted, accepts it). The resolved value may
-          # have come from the new `folder:` input.
+          # ---- standard digest-only anchor body -----------------------
+          # Wire key is the CANONICAL `folder_slug` (vocabulary sunset,
+          # 2026-06). The resolved value may have come from either the
+          # `folder:` or the legacy `matter:` input.
           BODY="$(jq -nc \
-            --arg matter "$RESOLVED_SLUG" \
+            --arg folder "$RESOLVED_SLUG" \
             --arg sha "$SHA" \
             --argjson size "$SIZE" \
             --arg label "${SATSIGNAL_LABEL:-}" \
             --arg filename "$BASENAME" \
             --argjson force_new "$FORCE_NEW_BOOL" \
             '{
-              matter_slug: $matter,
+              folder_slug: $folder,
               sha256_hex: $sha,
               file_size: $size,
               filename: $filename,
@@ -274,7 +276,7 @@ runs:
           -X POST "$ENDPOINT" \
           -H "Authorization: Bearer $SATSIGNAL_API_KEY" \
           -H "Content-Type: application/json" \
-          -H "User-Agent: satsignal-action/v0" \
+          -H "User-Agent: satsignal-action/v0.4" \
           --data-binary "$BODY")"
 
         # ---- handle errors -------------------------------------------
@@ -292,35 +294,37 @@ runs:
         fi
 
         # ---- parse + emit step outputs -------------------------------
-        # Read the new `proof_*` response keys if the server emits them
-        # (current API), else fall back to the frozen legacy keys
-        # (older / self-hosted servers). Both legacy AND new step
+        # Current servers emit CANONICAL response keys only (`proof_id`,
+        # `proof_url` — legacy keys are gone from 2xx responses). The
+        # legacy-key fallback is kept solely for self-hosted servers
+        # older than the 2026-06 sunset. Both canonical AND legacy step
         # outputs are then set so consumers on either spelling work.
-        BUNDLE_ID="$(jq -r '.proof_id // .bundle_id // ""' <"$TMP_RESP")"
+        PROOF_ID="$(jq -r '.proof_id // .bundle_id // ""' <"$TMP_RESP")"
         TXID="$(jq -r '.txid // ""' <"$TMP_RESP")"
-        RECEIPT_URL="$(jq -r '.proof_url // .receipt_url // ""' <"$TMP_RESP")"
+        PROOF_URL="$(jq -r '.proof_url // .receipt_url // ""' <"$TMP_RESP")"
         BUNDLE_URL="$(jq -r '.bundle_url // ""' <"$TMP_RESP")"
         DUPLICATE="$(jq -r '.duplicate // false' <"$TMP_RESP")"
         rm -f "$TMP_RESP"
 
         {
-          # legacy outputs — byte-identical names, kept forever
-          echo "bundle_id=$BUNDLE_ID"
+          # canonical outputs — the preferred public names
+          echo "proof_id=$PROOF_ID"
+          echo "proof_url=$PROOF_URL"
           echo "txid=$TXID"
-          echo "receipt_url=$RECEIPT_URL"
           echo "bundle_url=$BUNDLE_URL"
           echo "sha256=$SHA"
           echo "duplicate=$DUPLICATE"
-          # new public aliases — same values
-          echo "proof_id=$BUNDLE_ID"
-          echo "proof_url=$RECEIPT_URL"
+          # legacy output aliases — byte-identical names, kept forever
+          # (workflow consumers pin output names; additive only)
+          echo "bundle_id=$PROOF_ID"
+          echo "receipt_url=$PROOF_URL"
         } >>"$GITHUB_OUTPUT"
 
-        echo "::group::Receipt"
-        echo "  bundle_id:    $BUNDLE_ID"
-        echo "  txid:         $TXID"
-        echo "  receipt_url:  $RECEIPT_URL"
-        echo "  duplicate:    $DUPLICATE"
+        echo "::group::Proof"
+        echo "  proof_id:   $PROOF_ID"
+        echo "  txid:       $TXID"
+        echo "  proof_url:  $PROOF_URL"
+        echo "  duplicate:  $DUPLICATE"
         echo "::endgroup::"
 
         # GitHub Step Summary — Markdown block visible on the run page.
@@ -335,8 +339,8 @@ runs:
           echo "| file | \`$BASENAME\` |"
           echo "| sha256 | \`$SHA\` |"
           echo "| txid | \`$TXID\` |"
-          echo "| bundle_id | \`$BUNDLE_ID\` |"
-          if [[ -n "$RECEIPT_URL" ]]; then
-            echo "| receipt | [$RECEIPT_URL]($RECEIPT_URL) |"
+          echo "| proof_id | \`$PROOF_ID\` |"
+          if [[ -n "$PROOF_URL" ]]; then
+            echo "| proof | [$PROOF_URL]($PROOF_URL) |"
           fi
         } >>"$GITHUB_STEP_SUMMARY"

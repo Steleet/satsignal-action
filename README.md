@@ -27,10 +27,14 @@ produces the artifact; the next step gets a tamper-evident proof.
     echo "proof: ${{ steps.anchor.outputs.proof_url }}"
 ```
 
-> **Legacy spelling still works.** `matter:` is a frozen alias of
-> `folder:`, and `receipt_url` / `bundle_id` are frozen aliases of
-> `proof_url` / `proof_id`. Existing workflows keep working byte-for-byte
-> with no change; new ones should prefer `folder:` / `proof_url`.
+> **Compatibility.** `matter:` is a frozen alias of `folder:`, and the
+> `receipt_url` / `bundle_id` outputs are frozen aliases of `proof_url` /
+> `proof_id`. Existing workflows keep working byte-for-byte with no
+> change; new ones should use `folder:` / `proof_url`. Since v0.4.0 the
+> action speaks the canonical Satsignal wire vocabulary (sends
+> `folder_slug`, reads `proof_id` / `proof_url`); see
+> [Server compatibility](#server-compatibility) if you target an older
+> self-hosted server.
 
 The action computes `sha256(path)` locally and sends only the hash to
 Satsignal. The file's bytes never leave the runner.
@@ -70,9 +74,19 @@ values; use folder`) — this mirrors the Satsignal API's
 | `duplicate` | `false` | `true` if the API returned a prior anchor |
 
 `proof_id` / `proof_url` always carry the same values as the legacy
-`bundle_id` / `receipt_url`. The action reads the API's new `proof_*`
-response keys when present and transparently falls back to the legacy
-`receipt_url` / `bundle_id` keys against older / self-hosted servers.
+`bundle_id` / `receipt_url`. The action reads the API's canonical
+`proof_*` response keys (the only keys current servers emit) and
+transparently falls back to the legacy `receipt_url` / `bundle_id` keys
+against older / self-hosted servers.
+
+## Server compatibility
+
+As of v0.4.0 the action sends the canonical `folder_slug` request key
+(the Satsignal API's 2026-06 vocabulary sunset: responses emit canonical
+keys only; requests still accept legacy keys as silent aliases). If you
+point `api-base` at a self-hosted Satsignal server *older* than the
+sunset — one that only accepts `matter_slug` — pin
+`Steleet/satsignal-action@v0.3.0`, which sends the legacy key.
 
 ## Proof-on-PR pattern
 
@@ -182,9 +196,9 @@ for one-line verifier scripts.
   <https://app.satsignal.cloud>, store as a repository secret
   (`SATSIGNAL_API_KEY`), never hardcode in a workflow.
 - **Folder exists.** `inbox` is auto-provisioned for every workspace
-  and works out of the box; any other slug must be created first at
-  <https://app.satsignal.cloud/w/{workspace}/matters>. The action 404s
-  with `matter_not_found` if the slug doesn't resolve in your
+  and works out of the box; any other slug must be created first in
+  your workspace at <https://app.satsignal.cloud>. The action 404s
+  with `folder_not_found` if the slug doesn't resolve in your
   workspace.
 
 ## License
