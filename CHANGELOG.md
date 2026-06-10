@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.4.1 — 2026-06-10
+
+### Fixed
+- **jq 1.6 compatibility (default path):** the standard-anchor jq object
+  literal carried a trailing comma after `force_new: $force_new` — fine
+  on jq 1.7 (ubuntu-24.04) but a syntax error on jq 1.6 (ubuntu-22.04
+  runners and common self-hosted boxes), which killed the anchor step
+  under `set -euo pipefail`. The provenance path was unaffected.
+  (Probe finding S2-F2, 2026-06-10.)
+
+### Added
+- CI guard `jq16-compat` in the smoke workflow: rejects any trailing
+  comma before a closing brace in `action.yml` so the class of bug
+  can't land again (local jq 1.7 silently accepts them).
+
 ## v0.4.0 — 2026-06-09
 
 Canonical-vocabulary release (Satsignal vocabulary sunset, decision 0046).
